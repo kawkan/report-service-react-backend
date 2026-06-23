@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: report-service-react-backend
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "465"
+      - key: GOOGLE_SHEET_WEBHOOK_URL
+        sync: false

@@ -26,4 +26,4 @@ COPY . .
 EXPOSE 8000
 
 # คำสั่งรัน Server เมื่อ Deploy เสร็จสิ้น
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
