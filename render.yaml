@@ -19,3 +19,7 @@ services:
         value: "465"
       - key: GOOGLE_SHEET_WEBHOOK_URL
         sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false

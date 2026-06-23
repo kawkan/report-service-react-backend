@@ -3,12 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from supabase import create_client, Client
-import uvicorn, json, datetime, os, sys, asyncio, tempfile
+import uvicorn, json, datetime, os, sys, asyncio, tempfile, hashlib, secrets
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import smtplib
 from email.message import EmailMessage
 import urllib.request
+from types import SimpleNamespace
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -28,6 +29,13 @@ app.add_middleware(
 # ─── Supabase Authentication Setup (เพิ่มใหม่) ──────────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip().lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_TOKEN = (
+    "admin-" + hashlib.sha256(f"{ADMIN_EMAIL}:{ADMIN_PASSWORD}".encode("utf-8")).hexdigest()
+    if ADMIN_EMAIL and ADMIN_PASSWORD
+    else ""
+)
 
 if SUPABASE_URL and SUPABASE_KEY:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -47,6 +55,8 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=500, detail="ระบบ Supabase ไม่พร้อมใช้งาน กรุณาเช็คไฟล์ .env")
     
     token = credentials.credentials
+    if ADMIN_TOKEN and secrets.compare_digest(token, ADMIN_TOKEN):
+        return SimpleNamespace(email=ADMIN_EMAIL)
     try:
         user_res = supabase.auth.get_user(token)
         if not user_res.user:
@@ -72,6 +82,18 @@ async def signup(user: UserAuth):
 @app.post("/api/auth/login")
 async def login(user: UserAuth):
     """สำหรับล็อกอินเข้าสู่ระบบ"""
+    if (
+        ADMIN_TOKEN
+        and secrets.compare_digest(user.email.strip().lower(), ADMIN_EMAIL)
+        and secrets.compare_digest(user.password, ADMIN_PASSWORD)
+    ):
+        return {
+            "status": "success",
+            "access_token": ADMIN_TOKEN,
+            "user": {"email": ADMIN_EMAIL},
+        }
+
+
     if not supabase:
         raise HTTPException(status_code=500, detail="ระบบ Supabase ไม่พร้อมใช้งาน")
     try:
