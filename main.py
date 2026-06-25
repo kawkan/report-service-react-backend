@@ -3,12 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from supabase import create_client, Client
-import uvicorn, json, datetime, os, sys, asyncio, tempfile, hashlib, secrets
+import uvicorn, json, datetime, os, sys, asyncio, tempfile, hashlib, secrets, base64
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import smtplib
 from email.message import EmailMessage
 import urllib.request
+import urllib.error
 from types import SimpleNamespace
 
 if sys.platform == "win32":
@@ -295,6 +296,115 @@ W) http://www.testtrue.co.th, Line) @testtrue, FB) testtruepage
         return False, f"All emails failed: {[r['error'] for r in failed]}"
 
 # ─── 3. Google Sheet & Calendar ──────────────────────────────────────────────
+
+def send_email_with_pdf(data: dict, pdf_path: str):
+    info = data.get("generalInfo", {})
+    project = info.get("projectName", "-")
+    contact_name = info.get("contactName", "-")
+    recipients = [
+        str(recipient).strip()
+        for recipient in data.get("recipients", [])
+        if str(recipient).strip()
+    ]
+    if not recipients:
+        fallback = str(info.get("email", "")).strip()
+        recipients = [fallback] if fallback else []
+
+    api_key = os.getenv("BREVO_API_KEY", "").strip()
+    sender_email = os.getenv("BREVO_SENDER_EMAIL", "").strip()
+    sender_name = os.getenv("BREVO_SENDER_NAME", "Service Report").strip()
+
+    if not recipients or not api_key or not sender_email:
+        message = (
+            "Skipped sending "
+            f"(recipients={recipients}, missing BREVO_API_KEY or BREVO_SENDER_EMAIL)"
+        )
+        print(f"--> [EMAIL] {message}")
+        return False, message
+
+    attachment = None
+    if pdf_path and os.path.exists(pdf_path):
+        with open(pdf_path, "rb") as pdf_file:
+            attachment = {
+                "content": base64.b64encode(pdf_file.read()).decode("ascii"),
+                "name": os.path.basename(pdf_path),
+            }
+
+    subject = f"เอกสารรายงานการปฏิบัติงานเบื้องต้น - โครงการ {project}"
+    text_content = f"""เรียนคุณ {contact_name}
+
+ขอนำส่งรายงานการปฏิบัติงานเบื้องต้นสำหรับโครงการ {project}
+รายละเอียดอยู่ในไฟล์ PDF ที่แนบมากับอีเมลนี้
+
+ขอแสดงความนับถือ
+ระบบ Service Report
+"""
+    html_content = f"""
+    <html>
+      <body style="font-family:Tahoma,Arial,sans-serif;line-height:1.6;color:#1f2937">
+        <p>เรียนคุณ <strong>{contact_name}</strong></p>
+        <p>
+          ขอนำส่งรายงานการปฏิบัติงานเบื้องต้นสำหรับโครงการ
+          <strong>{project}</strong>
+        </p>
+        <p>รายละเอียดอยู่ในไฟล์ PDF ที่แนบมากับอีเมลนี้</p>
+        <br>
+        <p>ขอแสดงความนับถือ<br>ระบบ Service Report</p>
+      </body>
+    </html>
+    """
+
+    results = []
+    for recipient in recipients:
+        payload = {
+            "sender": {"name": sender_name, "email": sender_email},
+            "to": [{"email": recipient}],
+            "subject": subject,
+            "textContent": text_content,
+            "htmlContent": html_content,
+        }
+        if attachment:
+            payload["attachment"] = [attachment]
+
+        brevo_request = urllib.request.Request(
+            "https://api.brevo.com/v3/smtp/email",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "api-key": api_key,
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(brevo_request, timeout=30) as response:
+                response.read()
+            print(f"--> [EMAIL] Brevo sent successfully to {recipient}")
+            results.append({"to": recipient, "ok": True})
+        except urllib.error.HTTPError as error:
+            error_body = error.read().decode("utf-8", errors="replace")
+            error_message = f"Brevo API error {error.code}: {error_body}"
+            print(f"--> [EMAIL] Failed to send to {recipient}: {error_message}")
+            results.append({"to": recipient, "ok": False, "error": error_message})
+        except Exception as error:
+            error_message = f"Brevo connection error: {error}"
+            print(f"--> [EMAIL] Failed to send to {recipient}: {error_message}")
+            results.append({"to": recipient, "ok": False, "error": error_message})
+
+    failed = [result for result in results if not result["ok"]]
+    if not failed:
+        return True, f"Email sent successfully to {len(results)} recipient(s)"
+    if len(failed) < len(results):
+        sent_count = len(results) - len(failed)
+        failed_recipients = [result["to"] for result in failed]
+        return (
+            True,
+            f"Partial success: {sent_count}/{len(results)} sent. "
+            f"Failed: {failed_recipients}",
+        )
+    return False, f"All emails failed: {[result['error'] for result in failed]}"
+
 
 def save_to_google_sheet(data: dict) -> (bool, str):
     webhook_url = os.getenv("GOOGLE_SHEET_WEBHOOK_URL", "").strip()

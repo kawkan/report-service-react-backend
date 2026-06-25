@@ -222,20 +222,19 @@ Content-Type: application/json
 SUPABASE_URL=https://xxxxxxxxxxxx.supabase.co
 SUPABASE_KEY=your_supabase_anon_key
 
-# ── SMTP Email (Gmail) ───────────────────────────────
-SMTP_USER=your_gmail@gmail.com
-SMTP_PASS=your_gmail_app_password   # ใช้ App Password ไม่ใช่รหัสผ่านจริง
-SMTP_HOST=smtp.gmail.com            # ค่า default (ไม่บังคับ)
-SMTP_PORT=465                       # ค่า default (ไม่บังคับ)
+# ── Brevo Transactional Email API ────────────────────
+BREVO_API_KEY=your_brevo_api_key
+BREVO_SENDER_EMAIL=your_verified_sender@example.com
+BREVO_SENDER_NAME=Service Report
 
 # ── Google Sheets (Apps Script Webhook) ──────────────
 GOOGLE_SHEET_WEBHOOK_URL=https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec
 ```
 
-### วิธีรับ Gmail App Password
-1. เปิด Google Account → Security → 2-Step Verification (ต้องเปิดก่อน)
-2. ไปที่ **App passwords** → สร้าง password ใหม่
-3. นำ password ที่ได้ไปใส่ใน `SMTP_PASS`
+### วิธีตั้งค่า Brevo
+1. สร้าง API key ที่เมนู **SMTP & API → API Keys**
+2. เพิ่มและยืนยันอีเมลผู้ส่งที่เมนู **Senders & IP**
+3. นำ API key และอีเมลผู้ส่งไปตั้งค่าใน Render
 
 ---
 
@@ -347,8 +346,9 @@ nano .env
 ```dotenv
 SUPABASE_URL=https://xxxxxxxxxxxx.supabase.co
 SUPABASE_KEY=your_supabase_anon_key
-SMTP_USER=your_gmail@gmail.com
-SMTP_PASS=your_gmail_app_password
+BREVO_API_KEY=your_brevo_api_key
+BREVO_SENDER_EMAIL=your_verified_sender@example.com
+BREVO_SENDER_NAME=Service Report
 GOOGLE_SHEET_WEBHOOK_URL=https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec
 ```
 
