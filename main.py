@@ -1,16 +1,19 @@
-from fastapi import FastAPI, Request, HTTPException, Depends, status
+from fastapi import FastAPI, Request, HTTPException, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from supabase import create_client, Client
+from pydantic import BaseModel, Field
 import uvicorn, json, datetime, os, sys, asyncio, tempfile, hashlib, secrets, base64
+import jwt
+import psycopg
+from psycopg.rows import dict_row
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import smtplib
 from email.message import EmailMessage
 import urllib.request
 import urllib.error
-from types import SimpleNamespace
+from uuid import UUID, uuid4
+from ocr_service import ALLOWED_IMAGE_TYPES, scan_document_image
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -27,101 +30,591 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Supabase Authentication Setup (เพิ่มใหม่) ──────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# ─── PostgreSQL Authentication & Admin ───────────────────────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip() or secrets.token_urlsafe(48)
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "0") or "0")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip().lower()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-ADMIN_TOKEN = (
-    "admin-" + hashlib.sha256(f"{ADMIN_EMAIL}:{ADMIN_PASSWORD}".encode("utf-8")).hexdigest()
-    if ADMIN_EMAIL and ADMIN_PASSWORD
-    else ""
-)
-
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-else:
-    supabase = None
-    print("--> [Warning] Supabase URL หรือ Key ขาดหายใน .env (ระบบ Auth จะไม่ทำงาน)")
+ADMIN_NAME = os.getenv("ADMIN_NAME", "System Administrator").strip()
 
 security = HTTPBearer()
+
 
 class UserAuth(BaseModel):
     email: str
     password: str
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """ฟังก์ชันเช็ค Token เพื่อป้องกัน API"""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="ระบบ Supabase ไม่พร้อมใช้งาน กรุณาเช็คไฟล์ .env")
-    
-    token = credentials.credentials
-    if ADMIN_TOKEN and secrets.compare_digest(token, ADMIN_TOKEN):
-        return SimpleNamespace(email=ADMIN_EMAIL)
+
+class AdminCreateUser(BaseModel):
+    email: str
+    password: str = Field(min_length=8)
+    full_name: str = ""
+    role: str = "user"
+    is_active: bool = True
+
+
+class AdminUpdateUser(BaseModel):
+    email: str | None = None
+    password: str | None = Field(default=None, min_length=8)
+    full_name: str | None = None
+    role: str | None = None
+    is_active: bool | None = None
+
+
+class ScanDocumentResponse(BaseModel):
+    success: bool
+    status: str
+    message: str
+    data: dict
+    ocr_text: str = ""
+
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="ยังไม่ได้ตั้งค่า DATABASE_URL สำหรับ PostgreSQL",
+        )
     try:
-        user_res = supabase.auth.get_user(token)
-        if not user_res.user:
-            raise HTTPException(status_code=401, detail="Token ไม่ถูกต้องหรือหมดอายุ")
-        return user_res.user
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"กรุณาล็อกอินก่อนใช้งาน ({str(e)})")
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"เชื่อมต่อ PostgreSQL ไม่สำเร็จ: {error}",
+        )
 
 
-# ─── Auth Endpoints (เพิ่มใหม่) ────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=2**14,
+        r=8,
+        p=1,
+        dklen=64,
+    )
+    return f"scrypt$16384$8$1${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
 
-@app.post("/api/auth/signup")
-async def signup(user: UserAuth):
-    """สำหรับสมัครสมาชิกใหม่"""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="ระบบ Supabase ไม่พร้อมใช้งาน")
+
+def verify_password(password: str, password_hash: str) -> bool:
     try:
-        res = supabase.auth.sign_up({"email": user.email, "password": user.password})
-        return {"status": "success", "message": "สมัครสมาชิกสำเร็จ"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/api/auth/login")
-async def login(user: UserAuth):
-    """สำหรับล็อกอินเข้าสู่ระบบ"""
-    if (
-        ADMIN_TOKEN
-        and secrets.compare_digest(user.email.strip().lower(), ADMIN_EMAIL)
-        and secrets.compare_digest(user.password, ADMIN_PASSWORD)
-    ):
-        return {
-            "status": "success",
-            "access_token": ADMIN_TOKEN,
-            "user": {"email": ADMIN_EMAIL},
-        }
+        algorithm, n, r, p, salt_value, digest_value = password_hash.split("$", 5)
+        if algorithm != "scrypt":
+            return False
+        salt = base64.b64decode(salt_value)
+        expected = base64.b64decode(digest_value)
+        actual = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt,
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(expected),
+        )
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
 
 
-    if not supabase:
-        raise HTTPException(status_code=500, detail="ระบบ Supabase ไม่พร้อมใช้งาน")
-    try:
-        res = supabase.auth.sign_in_with_password({"email": user.email, "password": user.password})
-        return {
-            "status": "success", 
-            "access_token": res.session.access_token,
-            "user": {
-                "email": res.user.email if res.user else user.email,
-            },
-        }
-    except Exception as e:
-        raise HTTPException(status_code=401, detail="อีเมลหรือรหัสผ่านไม่ถูกต้อง")
+def create_access_token(user: dict) -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    payload = {
+        "sub": str(user["id"]),
+        "email": user["email"],
+        "role": user["role"],
+        "iat": now,
+    }
+    if JWT_EXPIRE_HOURS > 0:
+        payload["exp"] = now + datetime.timedelta(hours=JWT_EXPIRE_HOURS)
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-@app.get("/api/auth/me")
-async def get_me(current_user = Depends(get_current_user)):
-    """ใช้สำหรับตรวจสอบ session ปัจจุบันจาก access token"""
+def serialize_user(user: dict) -> dict:
     return {
-        "status": "success",
-        "user": {
-            "email": current_user.email,
-        },
+        "id": str(user["id"]),
+        "email": user["email"],
+        "full_name": user.get("full_name") or "",
+        "role": user.get("role") or "user",
+        "is_active": bool(user.get("is_active", True)),
+        "created_at": user.get("created_at").isoformat() if user.get("created_at") else "",
+        "updated_at": user.get("updated_at").isoformat() if user.get("updated_at") else "",
+        "last_sign_in_at": (
+            user.get("last_sign_in_at").isoformat()
+            if user.get("last_sign_in_at")
+            else ""
+        ),
     }
 
 
+def serialize_project(project: dict) -> dict:
+    return {
+        "id": str(project["id"]),
+        "project_name": project["project_name"],
+        "address": project.get("address") or "",
+        "contact_name": project.get("contact_name") or "",
+        "phone": project.get("phone") or "",
+        "email": project.get("email") or "",
+        "line_id": project.get("line_id") or "",
+        "last_used_at": (
+            project.get("last_used_at").isoformat()
+            if project.get("last_used_at")
+            else ""
+        ),
+    }
+
+
+def initialize_database():
+    if not DATABASE_URL:
+        print("--> [Warning] DATABASE_URL is missing (PostgreSQL auth is disabled)")
+        return
+
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.users') AS users_table")
+            if cursor.fetchone()["users_table"] is None:
+                cursor.execute(
+                    """
+                    CREATE TABLE users (
+                        id UUID PRIMARY KEY,
+                        email VARCHAR(320) NOT NULL UNIQUE,
+                        password_hash TEXT NOT NULL,
+                        full_name VARCHAR(200) NOT NULL DEFAULT '',
+                        role VARCHAR(20) NOT NULL DEFAULT 'user'
+                            CHECK (role IN ('admin', 'user')),
+                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        last_sign_in_at TIMESTAMPTZ
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX idx_users_email ON users (LOWER(email))"
+                )
+            cursor.execute("SELECT to_regclass('public.projects') AS projects_table")
+            if cursor.fetchone()["projects_table"] is None:
+                cursor.execute(
+                    """
+                    CREATE TABLE projects (
+                        id UUID PRIMARY KEY,
+                        project_key VARCHAR(320) NOT NULL UNIQUE,
+                        project_name VARCHAR(320) NOT NULL,
+                        address TEXT NOT NULL DEFAULT '',
+                        contact_name VARCHAR(200) NOT NULL DEFAULT '',
+                        phone VARCHAR(30) NOT NULL DEFAULT '',
+                        email VARCHAR(320) NOT NULL DEFAULT '',
+                        line_id VARCHAR(200) NOT NULL DEFAULT '',
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX idx_projects_last_used ON projects (last_used_at DESC)"
+                )
+            if ADMIN_EMAIL and ADMIN_PASSWORD:
+                cursor.execute(
+                    """
+                    INSERT INTO users (id, email, password_hash, full_name, role, is_active)
+                    VALUES (%s, %s, %s, %s, 'admin', TRUE)
+                    ON CONFLICT (email) DO UPDATE SET
+                        role = 'admin',
+                        is_active = TRUE,
+                        full_name = CASE
+                            WHEN users.full_name = '' THEN EXCLUDED.full_name
+                            ELSE users.full_name
+                        END
+                    """,
+                    (
+                        uuid4(),
+                        ADMIN_EMAIL,
+                        hash_password(ADMIN_PASSWORD),
+                        ADMIN_NAME,
+                    ),
+                )
+        connection.commit()
+    print("--> [Database] PostgreSQL users table is ready")
+
+
+@app.on_event("startup")
+async def startup_database():
+    try:
+        initialize_database()
+    except Exception as error:
+        print(f"--> [Database Warning] {error}")
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+        )
+        user_id = UUID(payload.get("sub", ""))
+    except (jwt.InvalidTokenError, ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="กรุณาเข้าสู่ระบบใหม่")
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, email, full_name, role, is_active, created_at,
+                       updated_at, last_sign_in_at
+                FROM users
+                WHERE id = %s
+                """,
+                (user_id,),
+            )
+            user = cursor.fetchone()
+
+    if not user:
+        raise HTTPException(status_code=401, detail="ไม่พบบัญชีผู้ใช้")
+    if not user["is_active"]:
+        raise HTTPException(status_code=403, detail="บัญชีนี้ถูกปิดใช้งาน")
+    return user
+
+
+def get_current_admin(current_user=Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="เฉพาะผู้ดูแลระบบเท่านั้น")
+    return current_user
+
+
+@app.post("/api/auth/signup")
+async def signup():
+    raise HTTPException(
+        status_code=403,
+        detail="การเพิ่มผู้ใช้ทำได้จากหน้า Admin เท่านั้น",
+    )
+
+
+@app.post("/api/auth/login")
+async def login(credentials: UserAuth):
+    email = credentials.email.strip().lower()
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, email, password_hash, full_name, role, is_active,
+                       created_at, updated_at, last_sign_in_at
+                FROM users
+                WHERE LOWER(email) = %s
+                """,
+                (email,),
+            )
+            user = cursor.fetchone()
+
+            if not user or not verify_password(credentials.password, user["password_hash"]):
+                raise HTTPException(status_code=401, detail="อีเมลหรือรหัสผ่านไม่ถูกต้อง")
+            if not user["is_active"]:
+                raise HTTPException(status_code=403, detail="บัญชีนี้ถูกปิดใช้งาน")
+
+            cursor.execute(
+                "UPDATE users SET last_sign_in_at = NOW() WHERE id = %s",
+                (user["id"],),
+            )
+        connection.commit()
+
+    user["last_sign_in_at"] = datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "status": "success",
+        "access_token": create_access_token(user),
+        "user": serialize_user(user),
+    }
+
+
+@app.get("/api/auth/me")
+async def get_me(current_user=Depends(get_current_user)):
+    return {"status": "success", "user": serialize_user(current_user)}
+
+
+@app.get("/api/projects")
+async def list_projects(
+    q: str = "",
+    limit: int = 10,
+    current_user=Depends(get_current_user),
+):
+    search = q.strip()
+    safe_limit = max(1, min(limit, 30))
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            if search:
+                pattern = f"%{search}%"
+                cursor.execute(
+                    """
+                    SELECT id, project_name, address, contact_name, phone,
+                           email, line_id, last_used_at
+                    FROM projects
+                    WHERE project_name ILIKE %s OR address ILIKE %s
+                    ORDER BY
+                        CASE WHEN project_name ILIKE %s THEN 0 ELSE 1 END,
+                        last_used_at DESC
+                    LIMIT %s
+                    """,
+                    (pattern, pattern, f"{search}%", safe_limit),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, project_name, address, contact_name, phone,
+                           email, line_id, last_used_at
+                    FROM projects
+                    ORDER BY last_used_at DESC
+                    LIMIT %s
+                    """,
+                    (safe_limit,),
+                )
+            projects = cursor.fetchall()
+    return {
+        "status": "success",
+        "projects": [serialize_project(project) for project in projects],
+    }
+
+
+async def process_ocr_scan(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+):
+    content_type = (file.content_type or "").lower()
+    filename = (file.filename or "").lower()
+    is_allowed_extension = filename.endswith((".jpg", ".jpeg", ".png"))
+
+    if content_type not in ALLOWED_IMAGE_TYPES and not is_allowed_extension:
+        raise HTTPException(
+            status_code=400,
+            detail="รองรับเฉพาะไฟล์ jpg, jpeg, png เท่านั้น",
+        )
+
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="ไม่พบไฟล์รูปภาพ")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="ไฟล์รูปภาพต้องไม่เกิน 8MB")
+
+    try:
+        result = scan_document_image(
+            image_bytes,
+            filename=file.filename or "document.jpg",
+            content_type=content_type,
+        )
+        print(f"--> [OCR] Scanned by {current_user['email']}: {file.filename}")
+        return {
+            "success": True,
+            "status": "success",
+            "message": "AI Fill Success",
+            "data": result["fields"],
+            "ocr_text": result["ocr_text"],
+        }
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+    except Exception as error:
+        print(f"--> [OCR] Unexpected error: {error}")
+        raise HTTPException(status_code=500, detail="Cannot detect information")
+
+
+@app.post("/api/ocr/scan", response_model=ScanDocumentResponse)
+async def scan_document_with_ocr_space(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+):
+    return await process_ocr_scan(file, current_user)
+
+
+@app.post("/api/scan-document", response_model=ScanDocumentResponse)
+async def scan_document_legacy_alias(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+):
+    return await process_ocr_scan(file, current_user)
+
+
+def remember_project(info: dict):
+    project_name = str(info.get("projectName", "") or "").strip()
+    if not project_name:
+        return None
+
+    project_key = " ".join(project_name.lower().split())
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO projects (
+                    id, project_key, project_name, address, contact_name,
+                    phone, email, line_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (project_key) DO UPDATE SET
+                    project_name = EXCLUDED.project_name,
+                    address = EXCLUDED.address,
+                    contact_name = EXCLUDED.contact_name,
+                    phone = EXCLUDED.phone,
+                    email = EXCLUDED.email,
+                    line_id = EXCLUDED.line_id,
+                    updated_at = NOW(),
+                    last_used_at = NOW()
+                RETURNING id, project_name, address, contact_name, phone,
+                          email, line_id, last_used_at
+                """,
+                (
+                    uuid4(),
+                    project_key,
+                    project_name,
+                    str(info.get("address", "") or "").strip(),
+                    str(info.get("contactName", "") or "").strip(),
+                    str(info.get("phone", "") or "").strip(),
+                    str(info.get("email", "") or "").strip(),
+                    str(info.get("lineId", "") or "").strip(),
+                ),
+            )
+            project = cursor.fetchone()
+        connection.commit()
+    return serialize_project(project)
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(current_admin=Depends(get_current_admin)):
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, email, full_name, role, is_active, created_at,
+                       updated_at, last_sign_in_at
+                FROM users
+                ORDER BY created_at DESC
+                """
+            )
+            users = cursor.fetchall()
+    return {"status": "success", "users": [serialize_user(user) for user in users]}
+
+
+@app.post("/api/admin/users")
+async def admin_create_user(
+    payload: AdminCreateUser,
+    current_admin=Depends(get_current_admin),
+):
+    email = payload.email.strip().lower()
+    role = "admin" if payload.role == "admin" else "user"
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO users
+                        (id, email, password_hash, full_name, role, is_active)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id, email, full_name, role, is_active, created_at,
+                              updated_at, last_sign_in_at
+                    """,
+                    (
+                        uuid4(),
+                        email,
+                        hash_password(payload.password),
+                        payload.full_name.strip(),
+                        role,
+                        payload.is_active,
+                    ),
+                )
+                user = cursor.fetchone()
+            connection.commit()
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="อีเมลนี้มีผู้ใช้งานแล้ว")
+
+    return {
+        "status": "success",
+        "message": "เพิ่มผู้ใช้เรียบร้อยแล้ว",
+        "user": serialize_user(user),
+    }
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def admin_update_user(
+    user_id: UUID,
+    payload: AdminUpdateUser,
+    current_admin=Depends(get_current_admin),
+):
+    updates = []
+    values = []
+
+    if payload.email is not None:
+        updates.append("email = %s")
+        values.append(payload.email.strip().lower())
+    if payload.password:
+        updates.append("password_hash = %s")
+        values.append(hash_password(payload.password))
+    if payload.full_name is not None:
+        updates.append("full_name = %s")
+        values.append(payload.full_name.strip())
+    if payload.role is not None:
+        next_role = "admin" if payload.role == "admin" else "user"
+        if current_admin["id"] == user_id and next_role != "admin":
+            raise HTTPException(status_code=400, detail="ไม่สามารถลดสิทธิ์บัญชีที่กำลังใช้งาน")
+        updates.append("role = %s")
+        values.append(next_role)
+    if payload.is_active is not None:
+        if current_admin["id"] == user_id and not payload.is_active:
+            raise HTTPException(status_code=400, detail="ไม่สามารถปิดบัญชีที่กำลังใช้งาน")
+        updates.append("is_active = %s")
+        values.append(payload.is_active)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="ไม่มีข้อมูลที่ต้องแก้ไข")
+
+    updates.append("updated_at = NOW()")
+    values.append(user_id)
+
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE users
+                    SET {", ".join(updates)}
+                    WHERE id = %s
+                    RETURNING id, email, full_name, role, is_active, created_at,
+                              updated_at, last_sign_in_at
+                    """,
+                    values,
+                )
+                user = cursor.fetchone()
+            connection.commit()
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="อีเมลนี้มีผู้ใช้งานแล้ว")
+
+    if not user:
+        raise HTTPException(status_code=404, detail="ไม่พบผู้ใช้")
+    return {
+        "status": "success",
+        "message": "บันทึกข้อมูลผู้ใช้เรียบร้อยแล้ว",
+        "user": serialize_user(user),
+    }
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def admin_delete_user(
+    user_id: UUID,
+    current_admin=Depends(get_current_admin),
+):
+    if current_admin["id"] == user_id:
+        raise HTTPException(status_code=400, detail="ไม่สามารถลบบัญชีที่กำลังใช้งาน")
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM users WHERE id = %s RETURNING id", (user_id,))
+            deleted = cursor.fetchone()
+        connection.commit()
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="ไม่พบผู้ใช้")
+    return {"status": "success", "message": "ลบผู้ใช้เรียบร้อยแล้ว"}
+
+
 # ─── 1. PDF Generation (Playwright) ──────────────────────────────────────────
+
 
 async def generate_pdf(html_content: str, filename: str) -> str:
     reports_dir = tempfile.gettempdir()
@@ -503,13 +996,20 @@ async def submit_report(request: Request, current_user = Depends(get_current_use
         
         # print ว่าใครเป็นคนเรียกใช้งาน (ดึงอีเมลคนที่ล็อกอินมาแสดง)
         print(f"\n=== Report Received: {form_type} ===")
-        print(f"--> Request by Auth User: {current_user.email}")
+        print(f"--> Request by Auth User: {current_user['email']}")
         
         recipients = data.get("recipients", [])
         print(f"--> Recipients: {recipients}")
         
         # ── Setup File Name ──
         info = data.get("generalInfo", {})
+        remembered_project = None
+        try:
+            remembered_project = remember_project(info)
+            if remembered_project:
+                print(f"--> [PROJECT] Remembered: {remembered_project['project_name']}")
+        except Exception as project_error:
+            print(f"--> [PROJECT] Could not remember project: {project_error}")
         report_datetime = info.get("reportDate", "")
         date_part = report_datetime.split("T")[0] if "T" in report_datetime else (report_datetime or datetime.datetime.now().strftime('%Y-%m-%d'))
         
@@ -557,6 +1057,10 @@ async def submit_report(request: Request, current_user = Depends(get_current_use
             "details": {
                 "email": {"ok": email_ok, "msg": email_msg},
                 "sheet": {"ok": sheet_ok, "msg": sheet_msg},
+                "project": {
+                    "ok": remembered_project is not None,
+                    "data": remembered_project,
+                },
             },
             "errors": errors,
         }

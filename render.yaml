@@ -5,10 +5,12 @@ services:
     plan: free
     autoDeploy: true
     envVars:
-      - key: SUPABASE_URL
+      - key: DATABASE_URL
         sync: false
-      - key: SUPABASE_KEY
-        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE_HOURS
+        value: 0
       - key: BREVO_API_KEY
         sync: false
       - key: BREVO_SENDER_EMAIL
@@ -17,7 +19,11 @@ services:
         value: Service Report
       - key: GOOGLE_SHEET_WEBHOOK_URL
         sync: false
+      - key: OCR_SPACE_API_KEY
+        sync: false
       - key: ADMIN_EMAIL
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
+      - key: ADMIN_NAME
+        value: System Administrator

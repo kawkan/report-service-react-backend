@@ -4,5 +4,6 @@ pydantic
 playwright
 python-dotenv
 python-multipart
-supabase
+psycopg[binary]
+PyJWT
 pydantic
