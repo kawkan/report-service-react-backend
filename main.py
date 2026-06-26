@@ -619,24 +619,31 @@ async def admin_delete_user(
 async def generate_pdf(html_content: str, filename: str) -> str:
     reports_dir = tempfile.gettempdir()
     pdf_path = os.path.join(reports_dir, filename)
-    
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        
+        browser = None
         try:
-            await page.set_content(html_content, wait_until="domcontentloaded", timeout=20000)
-        except Exception as e:
-            print(f"--> [Warning] set_content timeout/error: {e}")
-        
-        try:
-            await asyncio.wait_for(page.evaluate("document.fonts.ready"), timeout=10)
-        except:
-            print("--> [Warning] Fonts did not load in time, proceeding anyway.")
-        
-        await page.pdf(path=pdf_path, format="A4", print_background=True)
-        await browser.close()
-        
+            browser = await asyncio.wait_for(p.chromium.launch(headless=True), timeout=30)
+            page = await browser.new_page()
+
+            try:
+                await page.set_content(html_content, wait_until="domcontentloaded", timeout=20000)
+            except Exception as e:
+                print(f"--> [Warning] set_content timeout/error: {e}")
+
+            try:
+                await asyncio.wait_for(page.evaluate("document.fonts.ready"), timeout=10)
+            except Exception:
+                print("--> [Warning] Fonts did not load in time, proceeding anyway.")
+
+            await asyncio.wait_for(
+                page.pdf(path=pdf_path, format="A4", print_background=True),
+                timeout=45,
+            )
+        finally:
+            if browser:
+                await browser.close()
+
     print(f"--> [PDF Generated] {pdf_path}")
     return pdf_path
 
