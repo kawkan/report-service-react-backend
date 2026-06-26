@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import uvicorn, json, datetime, os, sys, asyncio, tempfile, hashlib, secrets, base64
+import html as html_lib
 import jwt
 import psycopg
 from psycopg.rows import dict_row
@@ -850,6 +851,85 @@ def send_email_with_pdf(data: dict, pdf_path: str):
         <p>รายละเอียดอยู่ในไฟล์ PDF ที่แนบมากับอีเมลนี้</p>
         <br>
         <p>ขอแสดงความนับถือ<br>ระบบ Service Report</p>
+      </body>
+    </html>
+    """
+
+    safe_project = html_lib.escape(str(project))
+    safe_contact_name = html_lib.escape(str(contact_name))
+    public_frontend_url = os.getenv(
+        "PUBLIC_FRONTEND_URL",
+        "https://report-service-react-frontend.vercel.app",
+    ).rstrip("/")
+    signature_logo_url = html_lib.escape(
+        os.getenv("EMAIL_SIGNATURE_LOGO_URL", f"{public_frontend_url}/img/Logo.jpg").strip()
+    )
+    signature_qr_url = html_lib.escape(
+        os.getenv("EMAIL_SIGNATURE_QR_URL", f"{public_frontend_url}/img/qrline.jpg").strip()
+    )
+
+    text_content = f"""{text_content}
+
+Best Regards,
+Sontaya Compeetong (Boy)
+Project Manager
+M: +66 99245 4363
+E: testtrueservice@gmail.com
+
+Test True Company Limited (Head Office)
+64/1 Moo 2, Lam Toi Ting Subdistrict, Nong Chok, Bangkok 10530
+Tax Registration Number 0105566123472
+W) http://www.testtrue.co.th, Line) @testtrue, FB) testtruepage
+"""
+
+    html_content = f"""
+    <html>
+      <body style="font-family:Tahoma,Arial,sans-serif;line-height:1.6;color:#1f2937;margin:0;padding:0">
+        <p>เรียนคุณ <strong>{safe_contact_name}</strong></p>
+        <p>
+          ขอนำส่งรายงานการปฏิบัติงานเบื้องต้นสำหรับโครงการ
+          <strong>{safe_project}</strong>
+        </p>
+        <p>รายละเอียดอยู่ในไฟล์ PDF ที่แนบมากับอีเมลนี้</p>
+        <p style="margin-top:36px">ขอแสดงความนับถือ<br>ระบบ Service Report อัตโนมัติ</p>
+
+        <div style="margin-top:28px;max-width:620px;border-top:1px solid #e5e7eb;padding-top:18px;color:#1f2937">
+          <img
+            src="{signature_qr_url}"
+            alt="Line QR Code"
+            width="145"
+            style="display:block;width:145px;max-width:145px;height:auto;margin:0 0 10px 0;border:0"
+          >
+          <p style="margin:0 0 2px 0;color:#07148a;font-size:16px;font-weight:700">Best Regards,</p>
+          <p style="margin:0;color:#1766a6;font-size:14px;font-weight:700">Sontaya Compeetong (Boy)</p>
+          <p style="margin:0;color:#1766a6;font-size:14px;font-weight:700">Project Manager</p>
+          <p style="margin:4px 0 0 0;color:#1766a6;font-size:14px;font-weight:700">
+            M: <a href="tel:+66992454363" style="color:#1766a6;text-decoration:underline">+66 99245 4363</a>
+          </p>
+          <p style="margin:0;color:#1766a6;font-size:14px;font-weight:700">
+            E: <a href="mailto:testtrueservice@gmail.com" style="color:#1766a6;text-decoration:underline">testtrueservice@gmail.com</a>
+          </p>
+
+          <div style="margin-top:18px;text-align:center;max-width:560px">
+            <img
+              src="{signature_logo_url}"
+              alt="TEST TRUE"
+              width="280"
+              style="display:block;width:280px;max-width:80%;height:auto;margin:0 auto 12px auto;border:0"
+            >
+            <p style="margin:0;color:#194f7d;font-size:15px;font-weight:700">Test True Company Limited (Head Office)</p>
+            <p style="margin:0;color:#7b7f87;font-size:14px;line-height:1.45">
+              64/1 Moo 2, Lam Toi Ting Subdistrict,<br>
+              Nong Chok, Bangkok 10530<br>
+              Tax Registration Number 0105566123472
+            </p>
+            <p style="margin:8px 0 0 0;color:#194f7d;font-size:14px;line-height:1.45">
+              W) <a href="https://www.testtrue.co.th/" style="color:#194f7d;text-decoration:none">http://www.testtrue.co.th</a>,
+              Line) <a href="https://lin.ee/9Qqs1nJ" style="color:#194f7d;text-decoration:none">@testtrue</a>,
+              FB) <a href="https://web.facebook.com/Testtrue" style="color:#194f7d;text-decoration:none">testtruepage</a>
+            </p>
+          </div>
+        </div>
       </body>
     </html>
     """
